@@ -582,6 +582,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 	}
 	attempted := make(map[string]struct{})
+	sessionRetries := make(sessionTransportRetries)
 	var lastErr error
 	var upstreamErr error
 	for {
@@ -778,6 +779,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			lastErr = authErr
 			if homeMode {
 				homeAuthCount++
+			} else if sessionRetries.allow(ctx, pickOpts.Metadata, auth.ID, authErr) {
+				delete(tried, auth.ID)
 			}
 			continue
 		}
@@ -1028,6 +1031,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	lastHomeAuthID := ""
 	homeSameAuthRetryPending := false
 	attempted := make(map[string]struct{})
+	sessionRetries := make(sessionTransportRetries)
 	var lastErr error
 	var upstreamErr error
 	var roundTiming homeRetryRoundTiming
@@ -1340,6 +1344,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			if homeMode {
 				homeAuthCount++
+			} else if selection == nil && sessionRetries.allow(ctx, execOpts.Metadata, auth.ID, errStream) {
+				delete(tried, auth.ID)
 			}
 			continue
 		}

@@ -2266,7 +2266,7 @@ func isTransientSyscallError(err error) bool {
 		syscall.ETIMEDOUT, syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.EPIPE:
 		return true
 	default:
-		return false
+		return isHubTransientErrno(errno)
 	}
 }
 
@@ -2292,7 +2292,8 @@ func isTransientTransportMessage(message string) bool {
 		strings.Contains(lower, "connection aborted"),
 		strings.Contains(lower, "use of closed network connection"),
 		strings.Contains(lower, "unexpected eof"),
-		isHTTP2ClosedConnectionMessage(lower):
+		isHTTP2ClosedConnectionMessage(lower),
+		isHubTransientTransportMessage(lower):
 		return true
 	default:
 		return false
