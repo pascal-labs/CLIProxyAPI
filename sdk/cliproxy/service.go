@@ -45,6 +45,7 @@ type Service struct {
 	authRegWaiters         map[string]chan struct{}
 	configSequence         uint64
 	appliedRoutingState    *routingRuntimeState
+	hub                    hubRuntime
 
 	// proxyPoolPublisher scopes connection-pool fencing to this service, so a reload
 	// here never retires config snapshots served by another service.

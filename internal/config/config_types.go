@@ -567,6 +567,9 @@ type RoutingConfig struct {
 	//     keep the binding and return the error (or retry the same credential) instead.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// SoonestReset tunes the "soonest-reset" strategy and the background quota poller.
+	SoonestReset SoonestResetConfig `yaml:"soonest-reset,omitempty" json:"soonest-reset,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

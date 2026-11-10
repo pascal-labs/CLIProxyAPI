@@ -896,6 +896,9 @@ func quotaObservationPayload(quota coreauth.QuotaState) gin.H {
 		signals[key] = value
 	}
 	observed["signals"] = signals
+	if windows := quotaWindowsPayload(quota.Windows); len(windows) > 0 {
+		observed["windows"] = windows
+	}
 	return observed
 }
 

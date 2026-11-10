@@ -1,0 +1,6 @@
+{
+  "five_hour": { "utilization": 0, "resets_at": null },
+  "seven_day": { "utilization": 71, "resets_at": "2026-11-12T07:59:00+00:00" },
+  "seven_day_opus": { "utilization": 55, "resets_at": "2026-11-12T07:59:00+00:00" },
+  "iguana_necktie": { "utilization": 41, "resets_at": "2026-11-11T10:00:00.000000+00:00" }
+}

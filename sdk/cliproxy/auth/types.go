@@ -355,11 +355,15 @@ type QuotaState struct {
 	// Cooldown transitions must use applyCooldownFields so they cannot replace
 	// this snapshot.
 	Signals map[string]string `json:"signals,omitempty"`
+	// Windows stores structured 5h/weekly usage windows merged per key from the
+	// quota poller, response headers, and websocket events (see quota_window.go).
+	Windows []QuotaWindow `json:"windows,omitempty"`
 }
 
 // Clone returns an independent copy of the quota state.
 func (q QuotaState) Clone() QuotaState {
 	copyQuota := q
+	copyQuota.Windows = cloneQuotaWindows(q.Windows)
 	if len(q.Signals) > 0 {
 		copyQuota.Signals = make(map[string]string, len(q.Signals))
 		for key, value := range q.Signals {
