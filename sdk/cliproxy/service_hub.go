@@ -9,6 +9,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/quotapoller"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagestats"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -18,10 +20,12 @@ import (
 type hubRuntime struct {
 	mu     sync.Mutex
 	poller *quotapoller.Poller
+	usage  *usagestats.Aggregator
 }
 
-// startHubRuntime starts the Claude/Codex quota poller. It runs only in local
-// (non-Home) mode, after the auth manager has loaded credentials.
+// startHubRuntime starts the Claude/Codex quota poller and the per-credential
+// usage aggregator (persisted to <auth-dir>/usage-stats.json). It runs only in
+// local (non-Home) mode, after the auth manager has loaded credentials.
 func (s *Service) startHubRuntime(ctx context.Context) {
 	if s == nil || s.coreManager == nil {
 		return
@@ -40,19 +44,38 @@ func (s *Service) startHubRuntime(ctx context.Context) {
 		s.hub.poller.Start(ctx)
 		log.Infof("quota poller started (interval=%s)", s.quotaPollInterval())
 	}
+	if s.hub.usage == nil {
+		if cfg := s.currentConfig(); cfg != nil && cfg.AuthDir != "" {
+			authDir, errResolve := util.ResolveAuthDir(cfg.AuthDir)
+			if errResolve != nil {
+				log.WithError(errResolve).Warn("usage stats disabled: cannot resolve auth directory")
+				return
+			}
+			s.hub.usage = usagestats.Default()
+			if errStart := s.hub.usage.Start(authDir); errStart != nil {
+				log.WithError(errStart).Warn("usage stats: previous data not loaded; starting empty")
+			}
+		}
+	}
 }
 
-// stopHubRuntime stops the hub workers. It is safe to call more than once.
+// stopHubRuntime stops the poller and flushes usage statistics. It is safe to
+// call more than once.
 func (s *Service) stopHubRuntime() {
 	if s == nil {
 		return
 	}
 	s.hub.mu.Lock()
-	poller := s.hub.poller
-	s.hub.poller = nil
+	poller, usage := s.hub.poller, s.hub.usage
+	s.hub.poller, s.hub.usage = nil, nil
 	s.hub.mu.Unlock()
 	if poller != nil {
 		poller.Stop()
+	}
+	if usage != nil {
+		if errStop := usage.Stop(); errStop != nil {
+			log.WithError(errStop).Warn("usage stats: final persist failed")
+		}
 	}
 }
 

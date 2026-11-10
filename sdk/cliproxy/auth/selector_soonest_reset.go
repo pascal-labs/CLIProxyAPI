@@ -142,7 +142,7 @@ func RankSoonestReset(auths []*Auth, model string, opts SoonestResetOptions, now
 			continue
 		}
 		entry := SoonestResetRanking{Auth: auth, Eligible: true}
-		entry.Weekly, entry.FiveHour = relevantQuotaWindows(auth.Quota.Windows, model, now)
+		entry.Weekly, entry.FiveHour = RelevantQuotaWindows(auth.Quota.Windows, model, now)
 		entry.HasData = entry.Weekly != nil
 		switch {
 		case entry.Weekly != nil && entry.Weekly.RemainingPercent() < opts.MinRemainingPercent:
@@ -208,8 +208,9 @@ func breakSoonestResetTies(ranked []SoonestResetRanking) {
 	}
 }
 
-// relevantQuotaWindows picks the fresh weekly and 5-hour windows that apply to model.
-func relevantQuotaWindows(windows []QuotaWindow, model string, now time.Time) (weekly, fiveHour *QuotaWindow) {
+// RelevantQuotaWindows picks the fresh weekly and 5-hour windows that apply to
+// model (model-scoped first, then the overall window). Results are copies.
+func RelevantQuotaWindows(windows []QuotaWindow, model string, now time.Time) (weekly, fiveHour *QuotaWindow) {
 	return relevantQuotaWindow(windows, QuotaWindowKindWeekly, QuotaWindowKeyWeekly, model, now),
 		relevantQuotaWindow(windows, QuotaWindowKindFiveHour, QuotaWindowKeyFiveHour, model, now)
 }

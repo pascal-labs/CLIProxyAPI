@@ -331,7 +331,6 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
 		}
-		s.stopHubRuntime()
 		if watcher := s.currentWatcher(); watcher != nil {
 			if err := watcher.Stop(); err != nil {
 				log.Errorf("failed to stop file watcher: %v", err)
@@ -403,6 +402,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 		helps.RetireProxyPoolPublisher(s.proxyPoolPublisher)
 		usage.StopDefault()
+		s.stopHubRuntime()
 	})
 	return shutdownErr
 }
