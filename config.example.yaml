@@ -167,7 +167,7 @@ access:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first
+  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first, soonest-reset
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
   # Sticky requests (including inherited and LCP bindings) also consume weighted credits
@@ -184,6 +184,28 @@ routing:
   # In Home mode, compatible Home versions charge retained WS turns from usage after completion;
   # CPA preserves the retained credential and concurrency slot instead of redispatching each turn.
   # For OAuth/file credentials, add a top-level numeric "weight" field to the auth JSON.
+  # soonest-reset prefers the credential whose weekly quota window resets soonest, so
+  # allowance that is about to expire is spent first. It uses the requested model's own
+  # weekly bucket when one exists (e.g. Claude seven_day_fable for a Fable model), else the
+  # overall weekly window. Windows come from the background quota poller plus passive
+  # Claude/Codex rate-limit headers and Codex websocket rate-limit events; a window whose
+  # reset already passed counts as unknown. Resets within one minute tie and prefer more
+  # remaining allowance. Credentials without data rank after those with data and rotate
+  # round-robin. With session-affinity enabled, bound sessions keep their credential and
+  # only new or failed-over sessions use this order.
+  # Inspect the order with GET /v8/management/routing/order[?model=<model>].
+  soonest-reset:
+    # Skip credentials whose weekly remaining allowance is below this percentage,
+    # unless every candidate would be skipped. Default: 3
+    min-remaining-percent: 3
+    # Skip credentials whose 5-hour usage is at or above this percentage, unless every
+    # candidate would be skipped. Default: 98
+    max-5h-percent: 98
+    # How often Claude (/api/oauth/usage) and Codex (/backend-api/wham/usage) OAuth usage
+    # windows are polled, with +/-10% jitter. Credentials are also polled at startup and
+    # shortly after they are added or their token changes. "0" disables the poller
+    # (header/websocket observations still apply). Default: "10m"
+    poll-interval: "10m"
   # Enable universal session-sticky routing for all clients.
   # Explicit Claude Code, Codex, OpenCode, pi, and generic (X-Session-ID) session headers
   # are preferred, followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,
