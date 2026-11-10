@@ -15,6 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	kimiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/hubsidecar"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
@@ -50,7 +51,7 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 			continue
 		}
 		name := e.Name()
-		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+		if !strings.HasSuffix(strings.ToLower(name), ".json") || hubsidecar.IsFile(name) {
 			continue
 		}
 		full := filepath.Join(ctx.AuthDir, name)
