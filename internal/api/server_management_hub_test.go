@@ -35,15 +35,22 @@ func TestManagementHubRoutesShareAccessControl(t *testing.T) {
 			}
 			cfg.Home.Enabled = tc.home
 			cfg.Plugins.Dir = filepath.Dir(path)
-			h := management.NewHandler(cfg, path, nil)
-			h.SetLocalPassword("test-password")
-			s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
-			s.managementRoutesEnabled.Store(tc.enabled)
-			s.registerManagementRoutes()
 			for _, route := range []string{
 				"/v0/management/usage/accounts", "/v8/management/usage/accounts?window=7d",
 				"/v0/management/routing/order", "/v8/management/routing/order?model=claude-fable-5",
+				"/v0/management/usage/models", "/v8/management/usage/models?window=30d",
+				"/v0/management/usage/sessions", "/v8/management/usage/sessions?window=7d&limit=5",
+				"/v0/management/usage/runway", "/v8/management/usage/runway",
+				"/v0/management/usage/value", "/v8/management/usage/value?window=24h",
+				"/v0/management/usage/events", "/v8/management/usage/events?window=7d&limit=10",
 			} {
+				// A fresh server per route keeps the failed-auth ban (five
+				// misses per address) out of the unauthorized case.
+				h := management.NewHandler(cfg, path, nil)
+				h.SetLocalPassword("test-password")
+				s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
+				s.managementRoutesEnabled.Store(tc.enabled)
+				s.registerManagementRoutes()
 				req := httptest.NewRequest(http.MethodGet, route, nil)
 				req.RemoteAddr = "127.0.0.1:1234"
 				if tc.authorized {

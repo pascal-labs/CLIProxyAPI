@@ -241,6 +241,14 @@ routing:
   #     keep the binding and return the error (or retry the same credential) instead.
   # Ignored when routing.session-affinity is false.
   session-affinity-rebind-on: "any"
+  # Session bindings (with their expiry) and the latest quota windows are saved to
+  # <auth-dir>/session-affinity.json and <auth-dir>/quota-windows.json every 30s and on
+  # shutdown, and restored before serving, so a restart neither re-binds sessions nor
+  # leaves soonest-reset without data. Expired bindings are dropped on load.
+  # A session-bound request whose attempt fails at the network level (timeout, reset,
+  # broken pipe, dropped stream; no HTTP status) retries its own credential once before
+  # trying another, so a network blip does not move a warm prompt cache to a cold
+  # credential. Such failures never cool down the credential.
 
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false
@@ -281,6 +289,30 @@ routing:
     # Cooldown duration in seconds for transient upstream errors (408/500/502/503/504/520-526).
     # Set to 0 to keep the legacy 60-second cooldown; set to -1 to disable transient error cooldowns.
     transient-error-cooldown-seconds: 0
+
+# Hub dashboard data, served under /v8/management/usage/{models,sessions,runway,value,events}
+# (also /v0/management). Usage, quota history and events are kept in sidecar files in the
+# auth directory (usage-stats.json, usage-sessions.json, quota-history.json, hub-events.json);
+# credential loaders and the auth-directory watcher ignore them.
+# hub:
+#   # API-equivalent prices in USD per million tokens, matched by model-id prefix (the
+#   # longest prefix wins). Entries override the built-in Claude prices per key; built-in
+#   # prices cover claude-fable-5-2, claude-fable-5-1, claude-opus-5-5, claude-opus-5,
+#   # claude-sonnet-5-5, claude-sonnet-5 and claude-haiku-5-5. Models without a price
+#   # (including every OpenAI/Codex model until configured) are reported as unpriced.
+#   # Cache writes with an unknown TTL are priced at the 5-minute rate.
+#   prices:
+#     claude-opus-5-5: {input: 4, output: 20, cache_read: 0.20, cache_write_5m: 5, cache_write_1h: 8}
+#   # Monthly subscription cost per credential, keyed by auth file name or auth_index,
+#   # prorated to the requested window (30-day month) for /usage/value.
+#   subscriptions:
+#     "claude-example.json": 200
+#   # Where /usage/sessions finds local agent session files for project, cwd and title:
+#   # Claude Code <root>/projects/*/<session-id>.jsonl, Codex
+#   # <root>/sessions/**/rollout-*-<id>.jsonl and <root>/session_index.jsonl.
+#   # Default: $CLAUDE_CONFIG_DIR, ~/.claude, ~/.claude-hub, $CODEX_HOME, ~/.codex.
+#   # T3 Code thread titles are read from <auth-dir>/t3-threads.json when present.
+#   session-roots: []
 
 # Shared request/response behavior.
 requests:
