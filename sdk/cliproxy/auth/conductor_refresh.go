@@ -1638,6 +1638,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 			}
 		}
 		m.mu.Unlock()
+		emitHubRefreshFailure(auth, unauthorized, invalidGrant)
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		} else if shouldUnschedule {

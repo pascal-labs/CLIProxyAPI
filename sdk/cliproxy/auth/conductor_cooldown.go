@@ -904,6 +904,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	modelKey := canonicalModelKey(result.Model)
 
 	var authSnapshot *Auth
+	var hubBefore hubHealth
 	cooldownStateChanged := false
 	scheduleUnauthorizedRefresh := false
 	now := time.Now()
@@ -950,6 +951,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 		modelState := existingModelState(auth, modelKey)
+		hubBefore = captureHubHealth(auth, modelKey, now)
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {
 			auth.Success++
@@ -1425,6 +1427,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+	if !m.HomeEnabled() {
+		emitHubResultEvents(result, hubBefore, authSnapshot, modelKey, now)
+	}
 	m.updateSessionAffinity(result)
 }
 

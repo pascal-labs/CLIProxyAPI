@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/hubsidecar"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/quotahistory"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -36,6 +37,9 @@ type hubStatePersister struct {
 	windowsPath  string
 	manager      *coreauth.Manager
 	interval     time.Duration
+	// history, when set, receives every credential's windows on each save so
+	// the runway view has utilization samples from polls and headers alike.
+	history *quotahistory.Store
 
 	mu           sync.Mutex
 	selector     *coreauth.SessionAffinitySelector
@@ -195,6 +199,9 @@ func (p *hubStatePersister) Save() error {
 		if auth, ok := p.manager.GetByID(authID); ok && auth != nil {
 			entry.AuthIndex = auth.EnsureIndex()
 			entry.Provider = strings.ToLower(strings.TrimSpace(auth.Provider))
+		}
+		if p.history != nil {
+			p.history.Record(entry.AuthID, entry.AuthIndex, entry.Provider, entry.Windows)
 		}
 		windows = append(windows, entry)
 	}

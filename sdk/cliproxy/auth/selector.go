@@ -1251,10 +1251,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, cachedAuthID, now) {
 			bind(cachedAuthID, false)
 			entry.Infof("session-affinity: cache hit but auth transiently unavailable, failover without rebinding | session=%s bound_auth=%s failover_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, auth.ID, provider, model)
+			emitHubAffinityEvent(HubEventFailover, primaryID, cachedAuthID, auth, model)
 			return auth, nil
 		}
 		bind(auth.ID, true)
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		emitHubAffinityEvent(HubEventRebind, primaryID, cachedAuthID, auth, model)
 		return auth, nil
 	}
 
@@ -1312,6 +1314,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				}
 				bind(cachedAuthID, false)
 				entry.Infof("session-affinity: fallback cache hit but auth transiently unavailable, failover without rebinding | session=%s fallback=%s bound_auth=%s failover_auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), cachedAuthID, auth.ID, provider, model)
+				emitHubAffinityEvent(HubEventFailover, primaryID, cachedAuthID, auth, model)
 				return auth, nil
 			}
 		}
