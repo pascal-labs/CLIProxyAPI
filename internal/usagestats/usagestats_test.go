@@ -158,16 +158,16 @@ func TestAggregatorBucketsHourlyAndQueriesWindows(t *testing.T) {
 func TestAggregatorRetention(t *testing.T) {
 	clock := &manualClock{now: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)}
 	agg := New(Options{Now: clock.Now})
-	agg.HandleUsage(context.Background(), claudeRecord(clock.Now().Add(-15*24*time.Hour), 1, 0, 0, 1))
-	if len(agg.Query(30*24*time.Hour)) != 0 {
+	agg.HandleUsage(context.Background(), claudeRecord(clock.Now().Add(-31*24*time.Hour), 1, 0, 0, 1))
+	if len(agg.Query(40*24*time.Hour)) != 0 {
 		t.Fatal("record older than the retention window was kept")
 	}
-	agg.HandleUsage(context.Background(), claudeRecord(clock.Now().Add(-13*24*time.Hour), 1, 0, 0, 1))
-	if len(agg.Query(30*24*time.Hour)) != 1 {
+	agg.HandleUsage(context.Background(), claudeRecord(clock.Now().Add(-29*24*time.Hour), 1, 0, 0, 1))
+	if len(agg.Query(40*24*time.Hour)) != 1 || len(agg.QueryModels(40*24*time.Hour)) != 1 {
 		t.Fatal("record inside the retention window was dropped")
 	}
 	clock.Set(clock.Now().Add(2 * 24 * time.Hour))
-	if len(agg.Query(30*24*time.Hour)) != 0 {
+	if len(agg.Query(40*24*time.Hour)) != 0 || len(agg.QueryModels(40*24*time.Hour)) != 0 {
 		t.Fatal("bucket was not pruned once it aged past retention")
 	}
 }

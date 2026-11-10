@@ -1,6 +1,7 @@
-// Package usagestats keeps hourly per-credential token usage in process so the
-// management API can report per-account request volume and cache efficiency
-// without draining the shared usage queue.
+// Package usagestats keeps hourly per-credential and per-model token usage, plus
+// per-session usage, in process so the management API can report request
+// volume, cache efficiency and API-equivalent value without draining the
+// shared usage queue.
 package usagestats
 
 import (
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/hubsidecar"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
@@ -24,7 +26,9 @@ const (
 	// FileName is the persistence file inside the auth directory.
 	FileName = "usage-stats.json"
 	// Retention is how long hourly buckets are kept.
-	Retention = 14 * 24 * time.Hour
+	Retention = 30 * 24 * time.Hour
+	// UnknownModel buckets records that carry no model name.
+	UnknownModel = "unknown"
 
 	pluginName        = "hub-usage-stats"
 	defaultFlushDelay = 30 * time.Second
@@ -141,6 +145,48 @@ type account struct {
 	authID   string
 	provider string
 	buckets  map[int64]*Tokens
+	// models holds the same usage split by model (model -> hour -> tokens).
+	models map[string]map[int64]*Tokens
+}
+
+func newAccount() *account {
+	return &account{buckets: make(map[int64]*Tokens), models: make(map[string]map[int64]*Tokens)}
+}
+
+func (a *account) modelBucket(model string, hour int64) *Tokens {
+	if a.models == nil {
+		a.models = make(map[string]map[int64]*Tokens)
+	}
+	hours := a.models[model]
+	if hours == nil {
+		hours = make(map[int64]*Tokens)
+		a.models[model] = hours
+	}
+	bucket := hours[hour]
+	if bucket == nil {
+		bucket = &Tokens{}
+		hours[hour] = bucket
+	}
+	return bucket
+}
+
+// ModelUsage is one credential's usage of one model over a queried window.
+type ModelUsage struct {
+	AuthIndex string
+	AuthID    string
+	Provider  string
+	Model     string
+	Totals    Tokens
+}
+
+// RecordModel returns the model a usage record is bucketed under.
+func RecordModel(record coreusage.Record) string {
+	for _, candidate := range []string{record.Model, record.ResponseModel, record.Alias} {
+		if model := strings.ToLower(strings.TrimSpace(candidate)); model != "" {
+			return model
+		}
+	}
+	return UnknownModel
 }
 
 // Options configures an Aggregator.
@@ -153,17 +199,20 @@ type Options struct {
 	Schedule func(delay time.Duration, fn func()) (stop func() bool)
 }
 
-// Aggregator keeps hourly usage buckets per credential (keyed by auth_index),
-// retains 14 days, and persists them atomically with a debounce.
+// Aggregator keeps hourly usage buckets per credential (keyed by auth_index)
+// and per model, plus per-session usage, retains 30 days, and persists them
+// atomically with a debounce.
 type Aggregator struct {
 	opts Options
 
-	mu        sync.Mutex
-	accounts  map[string]*account
-	path      string
-	loaded    bool
-	dirty     bool
-	stopTimer func() bool
+	mu           sync.Mutex
+	accounts     map[string]*account
+	sessions     map[string]*sessionEntry
+	path         string
+	sessionsPath string
+	loaded       bool
+	dirty        bool
+	stopTimer    func() bool
 
 	writeMu sync.Mutex
 }
@@ -187,12 +236,12 @@ func New(opts Options) *Aggregator {
 			return time.AfterFunc(delay, fn).Stop
 		}
 	}
-	return &Aggregator{opts: opts, accounts: make(map[string]*account)}
+	return &Aggregator{opts: opts, accounts: make(map[string]*account), sessions: make(map[string]*sessionEntry)}
 }
 
-// Start loads <authDir>/usage-stats.json, enables persistence, and registers
-// the aggregator as an in-process usage plugin (alongside, not instead of, the
-// usage queue).
+// Start loads <authDir>/usage-stats.json and <authDir>/usage-sessions.json,
+// enables persistence, and registers the aggregator as an in-process usage
+// plugin (alongside, not instead of, the usage queue).
 func (a *Aggregator) Start(authDir string) error {
 	if a == nil {
 		return nil
@@ -202,6 +251,7 @@ func (a *Aggregator) Start(authDir string) error {
 		return errors.New("usage stats: auth directory is empty")
 	}
 	path := filepath.Join(authDir, FileName)
+	sessionsPath := filepath.Join(authDir, SessionsFileName)
 	a.mu.Lock()
 	alreadyLoaded := a.loaded
 	a.loaded = true
@@ -211,9 +261,13 @@ func (a *Aggregator) Start(authDir string) error {
 		// A restarted service keeps its in-memory buckets instead of re-adding
 		// the file contents on top of them.
 		errLoad = a.load(path)
+		if errSessions := a.loadSessions(sessionsPath); errSessions != nil && errLoad == nil {
+			errLoad = errSessions
+		}
 	}
 	a.mu.Lock()
 	a.path = path
+	a.sessionsPath = sessionsPath
 	a.mu.Unlock()
 	coreusage.RegisterNamedPlugin(pluginName, a)
 	return errLoad
@@ -232,6 +286,7 @@ func (a *Aggregator) Stop() error {
 		a.stopTimer = nil
 	}
 	a.path = ""
+	a.sessionsPath = ""
 	a.mu.Unlock()
 	return errFlush
 }
@@ -250,10 +305,16 @@ func (a *Aggregator) HandleUsage(ctx context.Context, record coreusage.Record) {
 	if at.IsZero() {
 		at = a.opts.Now()
 	}
-	a.add(at, authIndex, strings.TrimSpace(record.AuthID), strings.ToLower(strings.TrimSpace(record.Provider)), TokensFromRecord(record))
+	provider := strings.ToLower(strings.TrimSpace(record.Provider))
+	model := RecordModel(record)
+	tokens := TokensFromRecord(record)
+	a.add(at, authIndex, strings.TrimSpace(record.AuthID), provider, model, tokens)
+	if sessionKey := strings.TrimSpace(record.SessionID); sessionKey != "" {
+		a.addSession(at, sessionKey, authIndex, provider, model, tokens)
+	}
 }
 
-func (a *Aggregator) add(at time.Time, authIndex, authID, provider string, tokens Tokens) {
+func (a *Aggregator) add(at time.Time, authIndex, authID, provider, model string, tokens Tokens) {
 	hour := at.UTC().Truncate(time.Hour).Unix()
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -262,7 +323,7 @@ func (a *Aggregator) add(at time.Time, authIndex, authID, provider string, token
 	}
 	entry := a.accounts[authIndex]
 	if entry == nil {
-		entry = &account{buckets: make(map[int64]*Tokens)}
+		entry = newAccount()
 		a.accounts[authIndex] = entry
 	}
 	if authID != "" {
@@ -277,6 +338,14 @@ func (a *Aggregator) add(at time.Time, authIndex, authID, provider string, token
 		entry.buckets[hour] = bucket
 	}
 	bucket.Add(tokens)
+	if model == "" {
+		model = UnknownModel
+	}
+	entry.modelBucket(model, hour).Add(tokens)
+	a.markDirtyLocked()
+}
+
+func (a *Aggregator) markDirtyLocked() {
 	a.dirty = true
 	if a.path != "" && a.stopTimer == nil {
 		a.stopTimer = a.opts.Schedule(a.opts.FlushDelay, a.flushFromTimer)
@@ -304,10 +373,21 @@ func (a *Aggregator) pruneLocked() {
 				delete(entry.buckets, hour)
 			}
 		}
+		for model, hours := range entry.models {
+			for hour := range hours {
+				if hour < cutoff {
+					delete(hours, hour)
+				}
+			}
+			if len(hours) == 0 {
+				delete(entry.models, model)
+			}
+		}
 		if len(entry.buckets) == 0 {
 			delete(a.accounts, authIndex)
 		}
 	}
+	a.pruneSessionsLocked(cutoff)
 }
 
 // Query returns usage for every credential with activity in the window. The
@@ -345,14 +425,69 @@ func (a *Aggregator) Query(window time.Duration) []AccountUsage {
 	return out
 }
 
+// QueryModels returns per-credential, per-model totals for every hour that
+// overlaps [now-window, now], skipping idle combinations.
+func (a *Aggregator) QueryModels(window time.Duration) []ModelUsage {
+	if a == nil {
+		return nil
+	}
+	now := a.opts.Now().UTC()
+	start := now.Add(-window).Truncate(time.Hour).Unix()
+	end := now.Truncate(time.Hour).Unix()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruneLocked()
+	var out []ModelUsage
+	for authIndex, entry := range a.accounts {
+		for model, hours := range entry.models {
+			usage := ModelUsage{AuthIndex: authIndex, AuthID: entry.authID, Provider: entry.provider, Model: model}
+			for hour, bucket := range hours {
+				if hour >= start && hour <= end {
+					usage.Totals.Add(*bucket)
+				}
+			}
+			if usage.Totals.Requests > 0 {
+				out = append(out, usage)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AuthIndex != out[j].AuthIndex {
+			return out[i].AuthIndex < out[j].AuthIndex
+		}
+		return out[i].Model < out[j].Model
+	})
+	return out
+}
+
+// persistedModel is one model's hourly buckets inside a persisted account.
+type persistedModel struct {
+	Model   string       `json:"model"`
+	Buckets []HourBucket `json:"buckets"`
+}
+
 // persistedAccount is one entry of usage-stats.json. The file is a top-level
 // JSON array on purpose: it lives in the auth directory, and every credential
 // loader only accepts JSON objects, so it can never be mistaken for a credential.
+//
+// Models was added later; files without it still load (per-model history then
+// starts empty) and older builds ignore it.
 type persistedAccount struct {
-	AuthIndex string       `json:"auth_index"`
-	AuthID    string       `json:"auth_id,omitempty"`
-	Provider  string       `json:"provider,omitempty"`
-	Buckets   []HourBucket `json:"buckets"`
+	AuthIndex string           `json:"auth_index"`
+	AuthID    string           `json:"auth_id,omitempty"`
+	Provider  string           `json:"provider,omitempty"`
+	Buckets   []HourBucket     `json:"buckets"`
+	Models    []persistedModel `json:"models,omitempty"`
+}
+
+func sortedHourBuckets(hours map[int64]*Tokens) []HourBucket {
+	buckets := make([]HourBucket, 0, len(hours))
+	for hour, bucket := range hours {
+		buckets = append(buckets, HourBucket{Hour: hour, Tokens: *bucket})
+	}
+	sort.Slice(buckets, func(i, j int) bool { return buckets[i].Hour < buckets[j].Hour })
+	return buckets
 }
 
 // Flush writes the current state when it changed since the last write.
@@ -364,7 +499,7 @@ func (a *Aggregator) Flush() error {
 	defer a.writeMu.Unlock()
 
 	a.mu.Lock()
-	path := a.path
+	path, sessionsPath := a.path, a.sessionsPath
 	if path == "" || !a.dirty {
 		a.mu.Unlock()
 		return nil
@@ -372,62 +507,27 @@ func (a *Aggregator) Flush() error {
 	a.pruneLocked()
 	snapshot := make([]persistedAccount, 0, len(a.accounts))
 	for authIndex, entry := range a.accounts {
-		persisted := persistedAccount{AuthIndex: authIndex, AuthID: entry.authID, Provider: entry.provider, Buckets: make([]HourBucket, 0, len(entry.buckets))}
-		for hour, bucket := range entry.buckets {
-			persisted.Buckets = append(persisted.Buckets, HourBucket{Hour: hour, Tokens: *bucket})
+		persisted := persistedAccount{AuthIndex: authIndex, AuthID: entry.authID, Provider: entry.provider, Buckets: sortedHourBuckets(entry.buckets)}
+		for model, hours := range entry.models {
+			persisted.Models = append(persisted.Models, persistedModel{Model: model, Buckets: sortedHourBuckets(hours)})
 		}
-		sort.Slice(persisted.Buckets, func(i, j int) bool { return persisted.Buckets[i].Hour < persisted.Buckets[j].Hour })
+		sort.Slice(persisted.Models, func(i, j int) bool { return persisted.Models[i].Model < persisted.Models[j].Model })
 		snapshot = append(snapshot, persisted)
 	}
+	sessions := a.sessionSnapshotLocked()
 	a.dirty = false
 	a.mu.Unlock()
 
 	sort.Slice(snapshot, func(i, j int) bool { return snapshot[i].AuthIndex < snapshot[j].AuthIndex })
-	if errWrite := writeFileAtomic(path, snapshot); errWrite != nil {
+	errWrite := hubsidecar.WriteJSONAtomic(path, snapshot)
+	if errWrite == nil && sessionsPath != "" {
+		errWrite = hubsidecar.WriteJSONAtomic(sessionsPath, sessions)
+	}
+	if errWrite != nil {
 		a.mu.Lock()
 		a.dirty = true
 		a.mu.Unlock()
-		return errWrite
-	}
-	return nil
-}
-
-func writeFileAtomic(path string, snapshot []persistedAccount) error {
-	data, errMarshal := json.Marshal(snapshot)
-	if errMarshal != nil {
-		return fmt.Errorf("usage stats: encode: %w", errMarshal)
-	}
-	dir := filepath.Dir(path)
-	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
-		return fmt.Errorf("usage stats: create directory: %w", errMkdir)
-	}
-	temp, errTemp := os.CreateTemp(dir, ".usage-stats-*.tmp")
-	if errTemp != nil {
-		return fmt.Errorf("usage stats: create temp file: %w", errTemp)
-	}
-	tempPath := temp.Name()
-	cleanup := func() {
-		if errRemove := os.Remove(tempPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
-			log.WithError(errRemove).Debug("usage stats: remove temp file")
-		}
-	}
-	if _, errWrite := temp.Write(data); errWrite != nil {
-		_ = temp.Close()
-		cleanup()
-		return fmt.Errorf("usage stats: write temp file: %w", errWrite)
-	}
-	if errSync := temp.Sync(); errSync != nil {
-		_ = temp.Close()
-		cleanup()
-		return fmt.Errorf("usage stats: sync temp file: %w", errSync)
-	}
-	if errClose := temp.Close(); errClose != nil {
-		cleanup()
-		return fmt.Errorf("usage stats: close temp file: %w", errClose)
-	}
-	if errRename := os.Rename(tempPath, path); errRename != nil {
-		cleanup()
-		return fmt.Errorf("usage stats: replace %s: %w", filepath.Base(path), errRename)
+		return fmt.Errorf("usage stats: %w", errWrite)
 	}
 	return nil
 }
@@ -454,7 +554,7 @@ func (a *Aggregator) load(path string) error {
 		}
 		entry := a.accounts[authIndex]
 		if entry == nil {
-			entry = &account{buckets: make(map[int64]*Tokens)}
+			entry = newAccount()
 			a.accounts[authIndex] = entry
 		}
 		if entry.authID == "" {
@@ -473,6 +573,18 @@ func (a *Aggregator) load(path string) error {
 				entry.buckets[bucket.Hour] = current
 			}
 			current.Add(bucket.Tokens)
+		}
+		for _, model := range item.Models {
+			name := strings.ToLower(strings.TrimSpace(model.Model))
+			if name == "" {
+				name = UnknownModel
+			}
+			for _, bucket := range model.Buckets {
+				if bucket.Hour < cutoff || bucket.Hour%3600 != 0 {
+					continue
+				}
+				entry.modelBucket(name, bucket.Hour).Add(bucket.Tokens)
+			}
 		}
 		if len(entry.buckets) == 0 {
 			delete(a.accounts, authIndex)

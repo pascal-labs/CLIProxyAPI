@@ -124,6 +124,10 @@ type Config struct {
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
+	// Hub configures the hub dashboard data (token prices, subscription costs,
+	// local session roots). See internal/config/hub.go.
+	Hub HubConfig `yaml:"hub,omitempty" json:"hub,omitempty"`
+
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
 
