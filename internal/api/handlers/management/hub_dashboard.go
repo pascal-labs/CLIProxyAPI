@@ -34,7 +34,23 @@ const (
 	runwayBurnFallback    = 24 * time.Hour
 	runwayCyclesPerWindow = 10
 	sessionResolveBudget  = 3 * time.Second
+
+	// A burn rate is only projected once the current cycle has at least
+	// runwayMinCycleSamples samples spanning the window kind's minimum, so a
+	// fresh start does not extrapolate a few minutes of traffic.
+	runwayMinCycleSamples = 3
+	runwayMinSpanFiveHour = time.Hour
+	runwayMinSpanWeekly   = 3 * time.Hour
+
+	// projection_status values on /usage/runway windows.
+	runwayProjectionOK       = "ok"
+	runwayProjectionLearning = "learning"
+	runwayProjectionIdle     = "idle"
 )
+
+// whatIfModels are the models every session's Claude tokens are re-priced on
+// for /usage/sessions what_if_usd.
+var whatIfModels = []string{"claude-opus-5-5", "claude-sonnet-5-5"}
 
 var hubWindowDurations = map[string]time.Duration{
 	"1h":  time.Hour,
@@ -111,6 +127,30 @@ func apiValueUSD(price config.HubModelPrice, tokens usagestats.Tokens) float64 {
 	return usd / 1e6
 }
 
+// cacheSavingsUSD is what the cache reads would have cost as fresh input
+// minus what they cost as cache reads.
+func cacheSavingsUSD(price config.HubModelPrice, tokens usagestats.Tokens) float64 {
+	return float64(tokens.CacheReadTokens) * (price.Input - price.CacheRead) / 1e6
+}
+
+// noCacheValueUSD prices the same traffic as if nothing were cached: every
+// prompt token (uncached input, cache reads and cache writes) at the input
+// rate, plus output.
+func noCacheValueUSD(price config.HubModelPrice, tokens usagestats.Tokens) float64 {
+	prompt := tokens.UncachedInputTokens + tokens.CacheReadTokens + tokens.CacheCreationTokens
+	return (float64(prompt)*price.Input + float64(tokens.OutputTokens)*price.Output) / 1e6
+}
+
+// isClaudeModel reports whether a model id names a Claude model (a provider
+// path prefix such as "anthropic/" is ignored).
+func isClaudeModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if index := strings.LastIndex(model, "/"); index >= 0 {
+		model = model[index+1:]
+	}
+	return strings.HasPrefix(model, "claude")
+}
+
 func roundUSD(value float64) float64 { return math.Round(value*10000) / 10000 }
 
 func roundRatio(value float64) float64 { return math.Round(value*10000) / 10000 }
@@ -155,6 +195,7 @@ type usageModelRow struct {
 	CacheCreation1hTokens int64    `json:"cache_creation_1h_tokens"`
 	CacheHitRatio         float64  `json:"cache_hit_ratio"`
 	APIValueUSD           *float64 `json:"api_value_usd"`
+	CacheSavingsUSD       *float64 `json:"cache_savings_usd"`
 	PriceKey              *string  `json:"price_key"`
 }
 
@@ -165,7 +206,9 @@ type usageModelsResponse struct {
 	UnpricedModels []string        `json:"unpriced_models"`
 }
 
-// GetUsageModels reports usage per credential and model with its API-equivalent value.
+// GetUsageModels reports usage per credential and model with its API-equivalent
+// value and cache savings (cache reads priced as fresh input minus their cache
+// price); both are null for unpriced models.
 //
 // Endpoint: GET /v8/management/usage/models?window=1h|24h|7d|30d (also under /v0/management).
 func (h *Handler) GetUsageModels(c *gin.Context) {
@@ -203,6 +246,7 @@ func (h *Handler) GetUsageModels(c *gin.Context) {
 		}
 		if price, key, priced := prices.Lookup(entry.Model); priced {
 			row.APIValueUSD = float64PtrRounded(apiValueUSD(price, entry.Totals), roundUSD)
+			row.CacheSavingsUSD = float64PtrRounded(cacheSavingsUSD(price, entry.Totals), roundUSD)
 			row.PriceKey = stringPtrOrNil(key)
 		} else {
 			unpriced[entry.Model] = struct{}{}
@@ -250,6 +294,77 @@ type usageSessionRow struct {
 	CacheHitRatio       float64  `json:"cache_hit_ratio"`
 	ColdCacheWrites     int64    `json:"cold_cache_writes"`
 	APIValueUSD         *float64 `json:"api_value_usd"`
+	// Models splits the session's usage by model.
+	Models []usageSessionModel `json:"models"`
+	// WhatIfUSD re-prices the session's Claude tokens on each of whatIfModels
+	// at the configured prices; null when the session has no Claude usage.
+	WhatIfUSD map[string]float64 `json:"what_if_usd"`
+}
+
+type usageSessionModel struct {
+	Model               string   `json:"model"`
+	Requests            int64    `json:"requests"`
+	InputTokens         int64    `json:"input_tokens"`
+	OutputTokens        int64    `json:"output_tokens"`
+	CacheReadTokens     int64    `json:"cache_read_tokens"`
+	CacheCreationTokens int64    `json:"cache_creation_tokens"`
+	APIValueUSD         *float64 `json:"api_value_usd"`
+}
+
+// sessionModelSplit returns the session's per-model rows (highest value
+// first, unpriced last, then most tokens), its total API value (priced is
+// false when no model had a price) and the what-if prices of its Claude tokens.
+func sessionModelSplit(models map[string]usagestats.Tokens, prices config.HubPriceTable) (rows []usageSessionModel, value float64, priced bool, whatIf map[string]float64) {
+	rows = make([]usageSessionModel, 0, len(models))
+	totals := make(map[string]float64, len(whatIfModels))
+	claude := false
+	for model, tokens := range models {
+		row := usageSessionModel{
+			Model:               model,
+			Requests:            tokens.Requests,
+			InputTokens:         tokens.InputTokens,
+			OutputTokens:        tokens.OutputTokens,
+			CacheReadTokens:     tokens.CacheReadTokens,
+			CacheCreationTokens: tokens.CacheCreationTokens,
+		}
+		if price, _, ok := prices.Lookup(model); ok {
+			modelValue := apiValueUSD(price, tokens)
+			row.APIValueUSD = float64PtrRounded(modelValue, roundUSD)
+			value += modelValue
+			priced = true
+		}
+		if isClaudeModel(model) {
+			claude = true
+			for _, target := range whatIfModels {
+				if price, _, ok := prices.Lookup(target); ok {
+					totals[target] += apiValueUSD(price, tokens)
+				}
+			}
+		}
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		left, right := rows[i], rows[j]
+		if (left.APIValueUSD == nil) != (right.APIValueUSD == nil) {
+			return left.APIValueUSD != nil
+		}
+		if left.APIValueUSD != nil && *left.APIValueUSD != *right.APIValueUSD {
+			return *left.APIValueUSD > *right.APIValueUSD
+		}
+		leftTokens := left.InputTokens + left.OutputTokens + left.CacheReadTokens + left.CacheCreationTokens
+		rightTokens := right.InputTokens + right.OutputTokens + right.CacheReadTokens + right.CacheCreationTokens
+		if leftTokens != rightTokens {
+			return leftTokens > rightTokens
+		}
+		return left.Model < right.Model
+	})
+	if claude && len(totals) > 0 {
+		whatIf = make(map[string]float64, len(totals))
+		for target, usd := range totals {
+			whatIf[target] = roundUSD(usd)
+		}
+	}
+	return rows, value, priced, whatIf
 }
 
 type usageSessionsResponse struct {
@@ -262,7 +377,9 @@ type usageSessionsResponse struct {
 // identity, e.g. "claude:<uuid>" or "codex:<uuid>"), most recent first, with
 // the session's working directory, title and T3 Code thread resolved from
 // local files. Token totals cover the window; first_seen/last_seen span the
-// retained history.
+// retained history. models splits the window's usage by model, and
+// what_if_usd re-prices the session's Claude tokens on Opus 5.5 and Sonnet
+// 5.5 (API-price estimates; null without Claude usage).
 //
 // Endpoint: GET /v8/management/usage/sessions?window=24h|7d|30d&limit=N (also under /v0/management).
 func (h *Handler) GetUsageSessions(c *gin.Context) {
@@ -322,13 +439,9 @@ func (h *Handler) GetUsageSessions(c *gin.Context) {
 		row.T3Title = stringPtrOrNil(info.T3Title)
 		row.T3ParentTitle = stringPtrOrNil(info.T3ParentTitle)
 		row.Subagent = info.Subagent
-		value, priced := 0.0, false
-		for model, tokens := range session.Models {
-			if price, _, ok := prices.Lookup(model); ok {
-				value += apiValueUSD(price, tokens)
-				priced = true
-			}
-		}
+		models, value, priced, whatIf := sessionModelSplit(session.Models, prices)
+		row.Models = models
+		row.WhatIfUSD = whatIf
 		if priced {
 			row.APIValueUSD = float64PtrRounded(value, roundUSD)
 		}
@@ -355,6 +468,8 @@ type runwayWindow struct {
 	BurnRatePctPerHour  *float64      `json:"burn_rate_pct_per_hour"`
 	ProjectedExhaustAt  *string       `json:"projected_exhaust_at"`
 	ExhaustsBeforeReset bool          `json:"exhausts_before_reset"`
+	ProjectionStatus    string        `json:"projection_status"`
+	LearningUntil       *string       `json:"learning_until"`
 	History             []runwayPoint `json:"history"`
 }
 
@@ -384,12 +499,50 @@ func runwayKind(kind string) string {
 	return "weekly"
 }
 
+// runwayLearningUntil returns zero when the cycle ending at resetsAt has
+// enough samples to project a burn rate, else an estimate of when it will:
+// the first sample of the cycle plus the kind's minimum span (now when there
+// is none yet), no earlier than the missing samples can arrive. A cycle that
+// resets before then starts learning again, so the estimate moves past the
+// reset.
+func runwayLearningUntil(samples []quotahistory.Sample, resetsAt time.Time, kind string, now time.Time) time.Time {
+	minSpan := runwayMinSpanWeekly
+	if kind == "five_hour" {
+		minSpan = runwayMinSpanFiveHour
+	}
+	count, first, last := quotahistory.CycleCoverage(samples, resetsAt)
+	if count >= runwayMinCycleSamples && last.Sub(first) >= minSpan {
+		return time.Time{}
+	}
+	start := first
+	if count == 0 {
+		start = now
+	}
+	ready := start.Add(minSpan)
+	if byCount := now.Add(time.Duration(runwayMinCycleSamples-count) * quotahistory.MinSpacing); count < runwayMinCycleSamples && byCount.After(ready) {
+		ready = byCount
+	}
+	if !ready.After(now) {
+		ready = now.Add(quotahistory.MinSpacing)
+	}
+	if !resetsAt.IsZero() && ready.After(resetsAt) {
+		ready = resetsAt.Add(minSpan)
+	}
+	return ready.UTC().Truncate(time.Second)
+}
+
 // GetUsageRunway reports, per Claude/Codex OAuth credential, each current
 // quota window with its burn rate (least squares over the current cycle's
 // samples in the last 6h, else 24h), the projected exhaustion time when it
 // falls before the reset, a 7-day history (at most 200 points), and the final
 // utilization of recently finished cycles (100 minus it is allowance that
 // went unused).
+//
+// The burn rate and projection are only computed once the current cycle has
+// at least 3 samples spanning 1h (five_hour) or 3h (weekly); until then
+// projection_status is "learning" with learning_until set, the rate and
+// projection are null and exhausts_before_reset is false (unless the window
+// is already at 100%). "idle" means enough history but no upward pace.
 //
 // Endpoint: GET /v8/management/usage/runway (also under /v0/management).
 func (h *Handler) GetUsageRunway(c *gin.Context) {
@@ -447,15 +600,29 @@ func buildRunwayAccount(auth *coreauth.Auth, provider string, history *quotahist
 			ObservedAt:  rfc3339Ptr(window.ObservedAt),
 			History:     make([]runwayPoint, 0),
 		}
-		rate, ok := quotahistory.BurnRate(samples, window.ResetsAt, now, runwayBurnLookback)
-		if !ok {
-			rate, ok = quotahistory.BurnRate(samples, window.ResetsAt, now, runwayBurnFallback)
+		learningUntil := runwayLearningUntil(samples, window.ResetsAt.UTC(), entry.Kind, now)
+		rate, ok := 0.0, false
+		if learningUntil.IsZero() {
+			rate, ok = quotahistory.BurnRate(samples, window.ResetsAt, now, runwayBurnLookback)
+			if !ok {
+				rate, ok = quotahistory.BurnRate(samples, window.ResetsAt, now, runwayBurnFallback)
+			}
+		}
+		switch {
+		case !learningUntil.IsZero():
+			entry.ProjectionStatus = runwayProjectionLearning
+			entry.LearningUntil = rfc3339Ptr(learningUntil)
+		case ok && rate > 0:
+			entry.ProjectionStatus = runwayProjectionOK
+		default:
+			entry.ProjectionStatus = runwayProjectionIdle
 		}
 		if ok {
 			entry.BurnRatePctPerHour = float64PtrRounded(rate, quotahistory.RoundPercent)
 		}
 		switch {
 		case window.UsedPercent >= 100:
+			// Already exhausted: an observation, not a projection.
 			entry.ExhaustsBeforeReset = true
 			entry.ProjectedExhaustAt = rfc3339Ptr(window.ObservedAt)
 		case ok && rate > 0:
@@ -510,6 +677,8 @@ type usageValueAccount struct {
 	Requests                 int64    `json:"requests"`
 	APIValueUSD              *float64 `json:"api_value_usd"`
 	HasUnpricedUsage         bool     `json:"has_unpriced_usage"`
+	CacheSavingsUSD          *float64 `json:"cache_savings_usd"`
+	NoCacheValueUSD          *float64 `json:"no_cache_value_usd"`
 	SubscriptionUSDPerMonth  *float64 `json:"subscription_usd_per_month"`
 	SubscriptionUSDForWindow *float64 `json:"subscription_usd_for_window"`
 	ValueRatio               *float64 `json:"value_ratio"`
@@ -517,6 +686,9 @@ type usageValueAccount struct {
 
 type usageValueTotals struct {
 	APIValueUSD              float64  `json:"api_value_usd"`
+	CacheSavingsUSD          float64  `json:"cache_savings_usd"`
+	NoCacheValueUSD          float64  `json:"no_cache_value_usd"`
+	HasUnpricedUsage         bool     `json:"has_unpriced_usage"`
 	SubscriptionUSDForWindow float64  `json:"subscription_usd_for_window"`
 	ValueRatio               *float64 `json:"value_ratio"`
 }
@@ -533,6 +705,10 @@ type usageValueResponse struct {
 // subscription cost prorated to the window (monthly cost x window / 30 days).
 // api_value_usd is null when the credential's usage is entirely unpriced;
 // value_ratio is null without a configured subscription or priced usage.
+// cache_savings_usd (cache reads priced as fresh input minus their cache
+// price) and no_cache_value_usd (the same traffic with every prompt token at
+// the input rate) cover priced usage only, like api_value_usd; totals carry
+// has_unpriced_usage when any credential's value leaves usage out.
 //
 // Endpoint: GET /v8/management/usage/value?window=24h|7d|30d (also under /v0/management).
 func (h *Handler) GetUsageValue(c *gin.Context) {
@@ -554,6 +730,8 @@ func (h *Handler) GetUsageValue(c *gin.Context) {
 		account usageValueAccount
 		authID  string
 		value   float64
+		savings float64
+		noCache float64
 		priced  bool
 	}
 	accounts := make(map[string]*accumulator)
@@ -570,6 +748,8 @@ func (h *Handler) GetUsageValue(c *gin.Context) {
 		entry.account.Requests += row.Totals.Requests
 		if price, _, priced := prices.Lookup(row.Model); priced {
 			entry.value += apiValueUSD(price, row.Totals)
+			entry.savings += cacheSavingsUSD(price, row.Totals)
+			entry.noCache += noCacheValueUSD(price, row.Totals)
 			entry.priced = true
 		} else {
 			entry.account.HasUnpricedUsage = true
@@ -594,8 +774,13 @@ func (h *Handler) GetUsageValue(c *gin.Context) {
 		account.Label = usageAccountLabel(auth, entry.authID)
 		if entry.priced || account.Requests == 0 {
 			account.APIValueUSD = float64PtrRounded(entry.value, roundUSD)
+			account.CacheSavingsUSD = float64PtrRounded(entry.savings, roundUSD)
+			account.NoCacheValueUSD = float64PtrRounded(entry.noCache, roundUSD)
 			totals.APIValueUSD += entry.value
+			totals.CacheSavingsUSD += entry.savings
+			totals.NoCacheValueUSD += entry.noCache
 		}
+		totals.HasUnpricedUsage = totals.HasUnpricedUsage || account.HasUnpricedUsage
 		fileName := entry.authID
 		if auth != nil && strings.TrimSpace(auth.FileName) != "" {
 			fileName = auth.FileName
@@ -615,6 +800,8 @@ func (h *Handler) GetUsageValue(c *gin.Context) {
 		totals.ValueRatio = float64PtrRounded(totals.APIValueUSD/totals.SubscriptionUSDForWindow, roundRatio)
 	}
 	totals.APIValueUSD = roundUSD(totals.APIValueUSD)
+	totals.CacheSavingsUSD = roundUSD(totals.CacheSavingsUSD)
+	totals.NoCacheValueUSD = roundUSD(totals.NoCacheValueUSD)
 	totals.SubscriptionUSDForWindow = roundUSD(totals.SubscriptionUSDForWindow)
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Provider != out[j].Provider {

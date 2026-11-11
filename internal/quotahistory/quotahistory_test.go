@@ -68,6 +68,15 @@ func TestCyclesAndBurnRate(t *testing.T) {
 	if len(later) != 2 || later[1].FinalUsedPercent != 40 {
 		t.Fatalf("cycles after second reset = %+v", later)
 	}
+	// Coverage counts only the current cycle (reset jitter within the slack still matches).
+	jittered := append(append([]Sample(nil), samples...), Sample{T: base.Add(8*time.Hour + 30*time.Minute), UsedPercent: 44, ResetsAt: secondReset.Add(2 * time.Minute)})
+	count, first, last := CycleCoverage(jittered, secondReset)
+	if count != 4 || !first.Equal(base.Add(6*time.Hour)) || !last.Equal(base.Add(8*time.Hour+30*time.Minute)) {
+		t.Fatalf("coverage = %d %v %v", count, first, last)
+	}
+	if count, _, _ := CycleCoverage(samples, base.Add(20*time.Hour)); count != 0 {
+		t.Fatalf("coverage of a future cycle = %d", count)
+	}
 }
 
 func TestDownsampleKeepsPeaks(t *testing.T) {

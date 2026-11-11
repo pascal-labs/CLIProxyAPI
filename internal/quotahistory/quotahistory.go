@@ -379,6 +379,33 @@ func Cycles(samples []Sample, now time.Time) []Cycle {
 	return cycles
 }
 
+// inCycle reports whether sample belongs to the cycle ending at resetsAt
+// (within cycleSlack); samples or windows without a reset always match.
+func inCycle(sample Sample, resetsAt time.Time) bool {
+	if resetsAt.IsZero() || sample.ResetsAt.IsZero() {
+		return true
+	}
+	return sample.ResetsAt.Sub(resetsAt) <= cycleSlack && resetsAt.Sub(sample.ResetsAt) <= cycleSlack
+}
+
+// CycleCoverage reports how many of the chronologically ordered samples
+// belong to the cycle ending at resetsAt, and when the first and last of them
+// were taken, so callers can tell whether a cycle has enough history to
+// project from.
+func CycleCoverage(samples []Sample, resetsAt time.Time) (count int, first, last time.Time) {
+	for _, sample := range samples {
+		if !inCycle(sample, resetsAt) {
+			continue
+		}
+		if count == 0 {
+			first = sample.T
+		}
+		last = sample.T
+		count++
+	}
+	return count, first, last
+}
+
 // BurnRate returns the least-squares slope (percentage points per hour) of the
 // samples that belong to the cycle ending at resetsAt and were taken within
 // lookback of now. ok is false with fewer than two such samples.
@@ -386,13 +413,8 @@ func BurnRate(samples []Sample, resetsAt, now time.Time, lookback time.Duration)
 	since := now.Add(-lookback)
 	var xs, ys []float64
 	for _, sample := range samples {
-		if sample.T.Before(since) || sample.T.After(now) {
+		if sample.T.Before(since) || sample.T.After(now) || !inCycle(sample, resetsAt) {
 			continue
-		}
-		if !resetsAt.IsZero() && !sample.ResetsAt.IsZero() {
-			if sample.ResetsAt.Sub(resetsAt) > cycleSlack || resetsAt.Sub(sample.ResetsAt) > cycleSlack {
-				continue
-			}
 		}
 		xs = append(xs, sample.T.Sub(since).Hours())
 		ys = append(ys, sample.UsedPercent)

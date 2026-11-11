@@ -106,6 +106,12 @@ func newHubFixture(t *testing.T) *hubFixture {
 	prevFiveReset := now.Add(-3 * time.Hour)
 	record(now.Add(-5*time.Hour), coreauth.QuotaWindow{Key: "five_hour", Kind: "5h", UsedPercent: 55, ResetsAt: prevFiveReset})
 	record(now.Add(-3*time.Hour-10*time.Minute), coreauth.QuotaWindow{Key: "five_hour", Kind: "5h", UsedPercent: 70, ResetsAt: prevFiveReset})
+	// Weekly windows need 3h of current-cycle history before they are projected;
+	// these sit on the same lines as the samples below.
+	record(now.Add(-4*time.Hour),
+		coreauth.QuotaWindow{Key: "seven_day", Kind: "7d", UsedPercent: 57, ResetsAt: weekReset},
+		coreauth.QuotaWindow{Key: "seven_day_fable", Kind: "7d", Model: "fable", UsedPercent: 0, ResetsAt: weekReset},
+	)
 	for i := 0; i <= 4; i++ {
 		at := now.Add(-2*time.Hour + time.Duration(i)*30*time.Minute)
 		record(at,
@@ -218,7 +224,11 @@ func TestHubDashboardUsageModels(t *testing.T) {
 	if fable["api_value_usd"] != 1.2186 || fable["requests"] != 2.0 || fable["auth_index"] != fixture.claudeA.Index || fable["cache_creation_5m_tokens"] != 120000.0 {
 		t.Fatalf("fable row = %#v", fable)
 	}
-	if codex := byModel["gpt-6.1-sol"]; codex["api_value_usd"] != nil || codex["uncached_input_tokens"] != 600.0 || codex["provider"] != "codex" {
+	// 90k cache reads x (8 input - 0.20 cache read) / 1e6.
+	if fable["cache_savings_usd"] != 0.702 {
+		t.Fatalf("fable cache savings = %v", fable["cache_savings_usd"])
+	}
+	if codex := byModel["gpt-6.1-sol"]; codex["api_value_usd"] != nil || codex["cache_savings_usd"] != nil || codex["uncached_input_tokens"] != 600.0 || codex["provider"] != "codex" {
 		t.Fatalf("codex row = %#v", codex)
 	}
 	if unpriced := body["unpriced_models"].([]any); len(unpriced) != 1 || unpriced[0] != "gpt-6.1-sol" {
@@ -241,7 +251,7 @@ func TestHubDashboardUsageSessions(t *testing.T) {
 	for _, session := range sessions {
 		assertKeys(t, "session", session, "session_key", "provider", "client", "project", "cwd", "title", "auth_indexes", "first_seen", "last_seen",
 			"requests", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "cache_hit_ratio", "cold_cache_writes", "api_value_usd",
-			"t3_thread_id", "t3_title", "t3_parent_title", "subagent")
+			"t3_thread_id", "t3_title", "t3_parent_title", "subagent", "models", "what_if_usd")
 		byKey[session["session_key"].(string)] = session
 	}
 	if sessions[0]["session_key"] != "codex:"+fixtureCodexSession {
@@ -255,10 +265,27 @@ func TestHubDashboardUsageSessions(t *testing.T) {
 	if claude["t3_thread_id"] != "t3-main" || claude["t3_title"] != "Dashboard work" || claude["t3_parent_title"] != nil || claude["subagent"] != false {
 		t.Fatalf("claude t3 = %#v", claude)
 	}
+	claudeModels := rows(t, claude, "models")
+	if len(claudeModels) != 1 {
+		t.Fatalf("claude models = %#v", claudeModels)
+	}
+	assertKeys(t, "session model", claudeModels[0], "model", "requests", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "api_value_usd")
+	if m := claudeModels[0]; m["model"] != "claude-fable-5-2" || m["requests"] != 2.0 || m["cache_read_tokens"] != 90000.0 || m["cache_creation_tokens"] != 120000.0 || m["api_value_usd"] != 1.2186 {
+		t.Fatalf("claude model split = %#v", m)
+	}
+	// Same tokens on Opus 5.5: (20x4 + 10x20 + 90k x0.20 + 120k x5) / 1e6; on Sonnet 5.5:
+	// (20x2 + 10x10 + 90k x0.10 + 120k x2.5) / 1e6.
+	whatIf, ok := claude["what_if_usd"].(map[string]any)
+	if !ok || len(whatIf) != 2 || whatIf["claude-opus-5-5"] != 0.6183 || whatIf["claude-sonnet-5-5"] != 0.3091 {
+		t.Fatalf("claude what_if = %#v", claude["what_if_usd"])
+	}
 	codex := byKey["codex:"+fixtureCodexSession]
 	if codex["client"] != "codex" || codex["cwd"] != "/work/poller" || codex["title"] != "Poller backoff" || codex["api_value_usd"] != nil ||
 		codex["t3_parent_title"] != "Dashboard work" || codex["subagent"] != true {
 		t.Fatalf("codex session = %#v", codex)
+	}
+	if codexModels := rows(t, codex, "models"); len(codexModels) != 1 || codexModels[0]["model"] != "gpt-6.1-sol" || codexModels[0]["api_value_usd"] != nil || codex["what_if_usd"] != nil {
+		t.Fatalf("codex split = %#v what_if = %#v", codexModels, codex["what_if_usd"])
 	}
 	unmatched := byKey["claude:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee:agent:a1"]
 	if unmatched["project"] != nil || unmatched["title"] != nil || unmatched["t3_thread_id"] != nil || unmatched["subagent"] != nil || unmatched["native_session_id"] != "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" {
@@ -290,25 +317,87 @@ func TestHubDashboardUsageRunway(t *testing.T) {
 	}
 	byKey := map[string]map[string]any{}
 	for _, window := range windows {
-		assertKeys(t, "window", window, "key", "kind", "used_percent", "resets_at", "burn_rate_pct_per_hour", "projected_exhaust_at", "exhausts_before_reset", "history")
+		assertKeys(t, "window", window, "key", "kind", "used_percent", "resets_at", "burn_rate_pct_per_hour", "projected_exhaust_at", "exhausts_before_reset",
+			"projection_status", "learning_until", "history")
 		byKey[window["key"].(string)] = window
 	}
 	five := byKey["five_hour"]
 	// 30 -> 42 over two hours = 6 %/h: 100% would take ~9.7h, after the 2h reset.
-	if five["kind"] != "five_hour" || five["burn_rate_pct_per_hour"] != 6.0 || five["exhausts_before_reset"] != false || five["projected_exhaust_at"] != nil {
+	if five["kind"] != "five_hour" || five["burn_rate_pct_per_hour"] != 6.0 || five["exhausts_before_reset"] != false || five["projected_exhaust_at"] != nil ||
+		five["projection_status"] != "ok" || five["learning_until"] != nil {
 		t.Fatalf("five_hour = %#v", five)
 	}
 	fable := byKey["seven_day_fable"]
-	// 40 -> 80 over two hours = 20 %/h: exhausted one hour from now, days before reset.
-	if fable["kind"] != "weekly" || fable["burn_rate_pct_per_hour"] != 20.0 || fable["exhausts_before_reset"] != true || fable["projected_exhaust_at"] != "2026-11-10T13:00:00Z" {
+	// 0 -> 80 over four hours = 20 %/h: exhausted one hour from now, days before reset.
+	if fable["kind"] != "weekly" || fable["burn_rate_pct_per_hour"] != 20.0 || fable["exhausts_before_reset"] != true || fable["projected_exhaust_at"] != "2026-11-10T13:00:00Z" ||
+		fable["projection_status"] != "ok" {
 		t.Fatalf("seven_day_fable = %#v", fable)
 	}
-	if history := fable["history"].([]any); len(history) != 5 {
+	if history := fable["history"].([]any); len(history) != 6 {
 		t.Fatalf("history = %#v", history)
 	}
 	cycles := rows(t, claudeA, "last_cycles")
 	if len(cycles) != 1 || cycles[0]["window_key"] != "five_hour" || cycles[0]["final_used_percent"] != 70.0 || cycles[0]["reset_at"] != "2026-11-10T09:00:00Z" {
 		t.Fatalf("last_cycles = %#v", cycles)
+	}
+}
+
+func TestHubDashboardRunwayLearningAndIdle(t *testing.T) {
+	fixture := newHubFixture(t)
+	now := fixture.now
+	history := quotaHistorySource()
+	fiveReset, weekReset := now.Add(3*time.Hour), now.Add(5*24*time.Hour)
+	record := func(at time.Time, windows ...coreauth.QuotaWindow) {
+		for i := range windows {
+			windows[i].ObservedAt = at
+		}
+		history.Record(fixture.claudeB.ID, fixture.claudeB.Index, "claude", windows)
+	}
+	// A fresh start: 20 minutes of fast-rising samples must not project anything.
+	record(now.Add(-20*time.Minute), coreauth.QuotaWindow{Key: "five_hour", Kind: "5h", UsedPercent: 10, ResetsAt: fiveReset})
+	record(now.Add(-10*time.Minute), coreauth.QuotaWindow{Key: "five_hour", Kind: "5h", UsedPercent: 20, ResetsAt: fiveReset})
+	// Four flat hours on the weekly window: enough history, no pace.
+	for _, hoursAgo := range []int{4, 2} {
+		record(now.Add(-time.Duration(hoursAgo)*time.Hour), coreauth.QuotaWindow{Key: "seven_day", Kind: "7d", UsedPercent: 15, ResetsAt: weekReset})
+	}
+	// A weekly window first seen two hours ago: learning until 3h after that.
+	record(now.Add(-2*time.Hour), coreauth.QuotaWindow{Key: "seven_day_fable", Kind: "7d", Model: "fable", UsedPercent: 5, ResetsAt: weekReset})
+	fixture.handler.authManager.ObserveQuotaWindows(fixture.claudeB.ID, []coreauth.QuotaWindow{
+		{Key: "five_hour", Kind: "5h", UsedPercent: 30, ResetsAt: fiveReset, ObservedAt: now, Source: "poll"},
+		{Key: "seven_day", Kind: "7d", UsedPercent: 15, ResetsAt: weekReset, ObservedAt: now, Source: "poll"},
+		{Key: "seven_day_fable", Kind: "7d", Model: "fable", UsedPercent: 25, ResetsAt: weekReset, ObservedAt: now, Source: "poll"},
+	})
+
+	body := serveHubJSON(t, fixture.handler.GetUsageRunway, "/v8/management/usage/runway")
+	byKey := map[string]map[string]any{}
+	for _, account := range rows(t, body, "accounts") {
+		if account["auth_index"] != fixture.claudeB.Index {
+			continue
+		}
+		for _, window := range rows(t, account, "windows") {
+			byKey[window["key"].(string)] = window
+		}
+	}
+	five := byKey["five_hour"]
+	// Three samples over 20 minutes: ready one hour after the first.
+	if five["projection_status"] != "learning" || five["learning_until"] != "2026-11-10T12:40:00Z" ||
+		five["burn_rate_pct_per_hour"] != nil || five["projected_exhaust_at"] != nil || five["exhausts_before_reset"] != false {
+		t.Fatalf("five_hour = %#v", five)
+	}
+	if fable := byKey["seven_day_fable"]; fable["projection_status"] != "learning" || fable["learning_until"] != "2026-11-10T13:00:00Z" || fable["burn_rate_pct_per_hour"] != nil {
+		t.Fatalf("seven_day_fable = %#v", fable)
+	}
+	if weekly := byKey["seven_day"]; weekly["projection_status"] != "idle" || weekly["learning_until"] != nil || weekly["burn_rate_pct_per_hour"] != 0.0 || weekly["exhausts_before_reset"] != false {
+		t.Fatalf("seven_day = %#v", weekly)
+	}
+
+	// Learning that cannot finish before the reset resumes in the next cycle.
+	samples := []quotahistory.Sample{{T: now.Add(-10 * time.Minute), UsedPercent: 90, ResetsAt: now.Add(20 * time.Minute)}}
+	if until := runwayLearningUntil(samples, now.Add(20*time.Minute), "five_hour", now); !until.Equal(now.Add(80 * time.Minute)) {
+		t.Fatalf("learning across a reset = %v", until)
+	}
+	if until := runwayLearningUntil(nil, time.Time{}, "weekly", now); !until.Equal(now.Add(3 * time.Hour)) {
+		t.Fatalf("learning without samples = %v", until)
 	}
 }
 
@@ -319,24 +408,31 @@ func TestHubDashboardUsageValue(t *testing.T) {
 	accounts := rows(t, body, "accounts")
 	byIndex := map[string]map[string]any{}
 	for _, account := range accounts {
-		assertKeys(t, "account", account, "auth_index", "provider", "label", "api_value_usd", "subscription_usd_per_month", "subscription_usd_for_window", "value_ratio")
+		assertKeys(t, "account", account, "auth_index", "provider", "label", "api_value_usd", "subscription_usd_per_month", "subscription_usd_for_window", "value_ratio",
+			"cache_savings_usd", "no_cache_value_usd")
 		byIndex[account["auth_index"].(string)] = account
 	}
 	a := byIndex[fixture.claudeA.Index]
 	if a["api_value_usd"] != 1.2186 || a["subscription_usd_per_month"] != 200.0 || a["subscription_usd_for_window"] != 200.0 || a["value_ratio"] != 0.0061 {
 		t.Fatalf("claude A = %#v", a)
 	}
+	// Without caching every prompt token is fresh input: (20 + 90k + 120k) x 8 + 10 x 40.
+	if a["cache_savings_usd"] != 0.702 || a["no_cache_value_usd"] != 1.6806 {
+		t.Fatalf("claude A cache = %v / %v", a["cache_savings_usd"], a["no_cache_value_usd"])
+	}
 	b := byIndex[fixture.claudeB.Index]
 	if b["subscription_usd_per_month"] != nil || b["value_ratio"] != nil || b["api_value_usd"] == nil {
 		t.Fatalf("claude B = %#v", b)
 	}
 	codex := byIndex[fixture.codexA.Index]
-	if codex["api_value_usd"] != nil || codex["has_unpriced_usage"] != true || codex["subscription_usd_for_window"] != 20.0 || codex["value_ratio"] != nil {
+	if codex["api_value_usd"] != nil || codex["has_unpriced_usage"] != true || codex["subscription_usd_for_window"] != 20.0 || codex["value_ratio"] != nil ||
+		codex["cache_savings_usd"] != nil || codex["no_cache_value_usd"] != nil {
 		t.Fatalf("codex = %#v", codex)
 	}
 	totals := body["totals"].(map[string]any)
-	assertKeys(t, "totals", totals, "api_value_usd", "subscription_usd_for_window", "value_ratio")
-	if totals["subscription_usd_for_window"] != 220.0 {
+	assertKeys(t, "totals", totals, "api_value_usd", "subscription_usd_for_window", "value_ratio", "cache_savings_usd", "no_cache_value_usd", "has_unpriced_usage")
+	// Claude B adds 4k Opus reads x 3.80 and (200 + 4k) x 4 + 50 x 20 without caching.
+	if totals["subscription_usd_for_window"] != 220.0 || totals["cache_savings_usd"] != 0.7172 || totals["no_cache_value_usd"] != 1.6984 || totals["has_unpriced_usage"] != true {
 		t.Fatalf("totals = %#v", totals)
 	}
 	week := serveHubJSON(t, fixture.handler.GetUsageValue, "/v8/management/usage/value?window=7d")
