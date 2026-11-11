@@ -28,6 +28,8 @@ const (
 	T3ThreadsFile = "t3-threads.json"
 	// AlertStateFile is written by companion alerting tooling.
 	AlertStateFile = "alert-state.json"
+	// BoxHealthFile is written by an external host-health exporter; the hub only reads it.
+	BoxHealthFile = "box-health.json"
 )
 
 var names = map[string]struct{}{
@@ -39,12 +41,18 @@ var names = map[string]struct{}{
 	HubEventsFile:       {},
 	T3ThreadsFile:       {},
 	AlertStateFile:      {},
+	BoxHealthFile:       {},
 }
 
 // IsFile reports whether path (or a bare file name) is a hub sidecar file.
+// Peer T3 exports pushed from other machines (t3-threads.<machine>.json)
+// count too, so their periodic pushes are not processed as credentials.
 func IsFile(path string) bool {
-	_, ok := names[strings.ToLower(filepath.Base(strings.TrimSpace(path)))]
-	return ok
+	name := strings.ToLower(filepath.Base(strings.TrimSpace(path)))
+	if _, ok := names[name]; ok {
+		return true
+	}
+	return strings.HasPrefix(name, "t3-threads.") && strings.HasSuffix(name, ".json") && len(name) > len("t3-threads..json")
 }
 
 // WriteJSONAtomic encodes value and replaces path with it through a temp file

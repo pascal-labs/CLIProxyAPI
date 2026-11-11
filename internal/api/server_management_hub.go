@@ -22,5 +22,6 @@ func (s *Server) registerManagementHubRoutes() {
 		group.GET("/usage/value", s.mgmt.GetUsageValue)
 		group.GET("/usage/events", s.mgmt.GetUsageEvents)
 		group.GET("/routing/order", s.mgmt.GetRoutingOrder)
+		group.GET("/box/health", s.mgmt.GetBoxHealth)
 	}
 }
