@@ -207,6 +207,14 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	if len(providers) == 0 && baseModel != resolvedModelName {
 		providers = util.GetProviderName(resolvedModelName)
 	}
+	if len(providers) == 0 {
+		providers = waitForStartupProviders(func() []string {
+			if found := util.GetProviderName(baseModel); len(found) > 0 || baseModel == resolvedModelName {
+				return found
+			}
+			return util.GetProviderName(resolvedModelName)
+		})
+	}
 
 	if len(providers) == 0 {
 		// The client asked for a model this proxy cannot route. Report it as a request
