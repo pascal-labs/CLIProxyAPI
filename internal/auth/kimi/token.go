@@ -114,7 +114,10 @@ func (ts *KimiTokenStorage) SaveTokenToFile(authFilePath string) error {
 		return fmt.Errorf("failed to merge metadata: %w", errMerge)
 	}
 
-	f, err := os.Create(authFilePath)
+	f, err := os.OpenFile(authFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) // login files are owner-only (Audit 1 C-3-3)
+	if err == nil {
+		_ = f.Chmod(0o600) // also fixes a file first created under a looser umask
+	}
 	if err != nil {
 		return fmt.Errorf("failed to create token file: %w", err)
 	}
