@@ -126,6 +126,62 @@ func TestQuotaWindowsFromCodexHeadersAndWebsocketEvents(t *testing.T) {
 	}
 }
 
+// Live promax headers (Nov 24): the weekly limit is the primary slot and the
+// secondary slot is empty. The empty slot used to become a second seven_day
+// window (0%, resetting at the observation) that replaced the real 15% one on
+// about half the responses, depending on map order.
+func TestQuotaWindowsFromCodexHeadersSkipsEmptySecondarySlot(t *testing.T) {
+	now := time.Unix(1795522395, 0).UTC()
+	headers := http.Header{
+		"X-Codex-Active-Limit":                         []string{"premium"},
+		"X-Codex-Plan-Type":                            []string{"promax"},
+		"X-Codex-Primary-Over-Secondary-Limit-Percent": []string{"0"},
+		"X-Codex-Primary-Reset-After-Seconds":          []string{"256031"},
+		"X-Codex-Primary-Reset-At":                     []string{"1795778426"},
+		"X-Codex-Primary-Used-Percent":                 []string{"15"},
+		"X-Codex-Primary-Window-Minutes":               []string{"10080"},
+		"X-Codex-Secondary-Reset-After-Seconds":        []string{"0"},
+		"X-Codex-Secondary-Used-Percent":               []string{"0"},
+		"X-Codex-Secondary-Window-Minutes":             []string{"0"},
+	}
+	for i := 0; i < 200; i++ {
+		windows := QuotaWindowsFromHeaders("codex", headers, now, QuotaWindowSourceHeaders)
+		if len(windows) != 1 {
+			t.Fatalf("run %d: windows = %#v, want only seven_day", i, windows)
+		}
+		got := windows[0]
+		if got.Key != "seven_day" || got.Kind != QuotaWindowKindWeekly || got.UsedPercent != 15 || !got.ResetsAt.Equal(time.Unix(1795778426, 0)) {
+			t.Fatalf("run %d: seven_day = %#v, want 15%% resetting 1795778426", i, got)
+		}
+	}
+}
+
+func TestQuotaWindowsFromCodexHeadersSlotCollisionIsDeterministic(t *testing.T) {
+	now := time.Unix(1785300000, 0).UTC()
+	// A secondary slot without a length is weekly by position; the primary slot
+	// says it is weekly explicitly, so the explicit one wins every time.
+	inferred := http.Header{
+		"X-Codex-Primary-Used-Percent":   []string{"15"},
+		"X-Codex-Primary-Window-Minutes": []string{"10080"},
+		"X-Codex-Secondary-Used-Percent": []string{"2"},
+	}
+	// Two explicit weekly-or-longer slots (e.g. a monthly team window): the more-used one binds.
+	explicit := http.Header{
+		"X-Codex-Primary-Used-Percent":     []string{"15"},
+		"X-Codex-Primary-Window-Minutes":   []string{"10080"},
+		"X-Codex-Secondary-Used-Percent":   []string{"40"},
+		"X-Codex-Secondary-Window-Minutes": []string{"43200"},
+	}
+	for i := 0; i < 200; i++ {
+		if got := quotaWindowMap(QuotaWindowsFromHeaders("codex", inferred, now, QuotaWindowSourceHeaders))["seven_day"]; got.UsedPercent != 15 {
+			t.Fatalf("run %d: inferred collision seven_day = %#v, want the explicit 15%%", i, got)
+		}
+		if got := quotaWindowMap(QuotaWindowsFromHeaders("codex", explicit, now, QuotaWindowSourceHeaders))["seven_day"]; got.UsedPercent != 40 {
+			t.Fatalf("run %d: explicit collision seven_day = %#v, want the binding 40%%", i, got)
+		}
+	}
+}
+
 func TestMarkResultMergesHeaderWindowsWithPolledWindows(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	auth, errRegister := manager.Register(context.Background(), &Auth{ID: "claude-window-auth", Provider: "claude"})

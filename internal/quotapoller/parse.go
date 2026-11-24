@@ -197,7 +197,8 @@ func applyClaudeLimits(byKey map[string]coreauth.QuotaWindow, limits ojson.Resul
 //     limit_window_seconds, reset_at (Unix seconds), reset_after_seconds}
 //     classified by limit_window_seconds (< 1 day -> five_hour, otherwise
 //     seven_day, which also covers the monthly team window); without a length
-//     the primary slot is the 5h window and the secondary slot the weekly one.
+//     the primary slot is the 5h window and the secondary slot the weekly one;
+//     a slot with limit_window_seconds 0 and nothing used is empty and skipped.
 //   - additional_rate_limits[]: {limit_name | metered_feature, rate_limit{...}}
 //     produce model-scoped windows keyed seven_day_<limit> / five_hour_<limit>.
 //   - a missing used_percent with limit_reached=true or allowed=false and a
@@ -253,7 +254,14 @@ func addCodexRateLimitWindows(byKey map[string]coreauth.QuotaWindow, info ojson.
 		if !slot.node.IsObject() {
 			continue
 		}
-		seconds, _ := numberValue(firstResult(slot.node, "limit_window_seconds", "limitWindowSeconds"))
+		seconds, hasSeconds := numberValue(firstResult(slot.node, "limit_window_seconds", "limitWindowSeconds"))
+		if hasSeconds && seconds == 0 {
+			// A zero-length slot with nothing used is an empty slot, not a window
+			// (the same shape as the empty x-codex-secondary-* headers).
+			if used, ok := numberValue(firstResult(slot.node, "used_percent", "usedPercent")); ok && used == 0 {
+				continue
+			}
+		}
 		kind := coreauth.QuotaWindowKindForSeconds(int64(seconds), slot.secondary)
 		resetAt, hasReset := resetValue(firstResult(slot.node, "reset_at", "resetAt"))
 		if !hasReset {

@@ -110,6 +110,22 @@ func TestParseCodexUsageCamelCaseAndLimitReached(t *testing.T) {
 	assertWindow(t, byKey, "seven_day_codex-bengalfox", "7d", "codex-bengalfox", 63, time.Unix(1786000500, 0).UTC())
 }
 
+func TestParseCodexUsageSkipsEmptyZeroLengthSlot(t *testing.T) {
+	now := time.Unix(1785300000, 0).UTC()
+	body := []byte(`{"rate_limit":{"allowed":true,"limit_reached":false,
+		"primary_window":{"used_percent":9,"limit_window_seconds":18000,"reset_after_seconds":600},
+		"secondary_window":{"used_percent":0,"limit_window_seconds":0,"reset_after_seconds":0}}}`)
+	windows, errParse := ParseCodexUsage(body, now)
+	if errParse != nil {
+		t.Fatalf("ParseCodexUsage() error = %v", errParse)
+	}
+	byKey := windowsByKey(windows)
+	if len(byKey) != 1 {
+		t.Fatalf("windows = %#v, want only five_hour (the empty slot is not a weekly window)", byKey)
+	}
+	assertWindow(t, byKey, "five_hour", "5h", "", 9, now.Add(10*time.Minute))
+}
+
 func TestParseUsageRejectsInvalidPayloads(t *testing.T) {
 	for _, body := range []string{"", "null", "[]", "{not json", `"text"`} {
 		if _, errParse := ParseClaudeUsage([]byte(body), time.Now()); errParse == nil {

@@ -327,10 +327,27 @@ func claudeQuotaWindowsFromHeaders(headers map[string]string, observedAt time.Ti
 // The namespace is empty for the main limit, a short name on the HTTP path
 // (x-codex-bengalfox-*), or additional-<limit> for websocket events. The
 // code-review limit does not gate model traffic and is skipped.
+//
+// Plans with a single weekly limit send it in the primary slot and an empty
+// secondary slot (window-minutes 0, used 0, reset-after 0). The empty slot is
+// skipped: classified by slot it would be a 0% weekly window resetting "now"
+// and, colliding with the real one on the same key, randomly replace it.
+// When two slots still map to one key, a slot with an explicit window length
+// beats one classified by slot position, then the more-used window wins (it is
+// the binding limit), so the result never depends on header order.
 func codexQuotaWindowsFromHeaders(headers map[string]string, observedAt time.Time, source string) []QuotaWindow {
 	const prefix = "x-codex-"
-	byKey := make(map[string]QuotaWindow)
+	type candidate struct {
+		window   QuotaWindow
+		explicit bool
+	}
+	byKey := make(map[string]candidate)
+	keys := make([]string, 0, len(headers))
 	for key := range headers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
 		if !strings.HasPrefix(key, prefix) {
 			continue
 		}
@@ -361,8 +378,15 @@ func codexQuotaWindowsFromHeaders(headers map[string]string, observedAt time.Tim
 				continue
 			}
 			var windowSeconds int64
-			if minutes, errMinutes := strconv.ParseInt(headers[base+"window-minutes"], 10, 64); errMinutes == nil && minutes > 0 {
-				windowSeconds = minutes * 60
+			explicit := false
+			if minutes, errMinutes := strconv.ParseInt(strings.TrimSpace(headers[base+"window-minutes"]), 10, 64); errMinutes == nil {
+				if minutes == 0 && used == 0 {
+					continue // empty slot, not a window
+				}
+				if minutes > 0 {
+					windowSeconds = minutes * 60
+					explicit = true
+				}
 			}
 			kind := QuotaWindowKindForSeconds(windowSeconds, slot == "secondary")
 			window := QuotaWindow{
@@ -378,15 +402,23 @@ func codexQuotaWindowsFromHeaders(headers map[string]string, observedAt time.Tim
 			} else if seconds, errSeconds := strconv.ParseFloat(headers[base+"reset-after-seconds"], 64); errSeconds == nil && seconds >= 0 && !math.IsInf(seconds, 0) {
 				window.ResetsAt = observedAt.Add(time.Duration(seconds * float64(time.Second))).Round(time.Second)
 			}
-			byKey[window.Key] = window
+			if prev, exists := byKey[window.Key]; exists {
+				if prev.explicit && !explicit {
+					continue
+				}
+				if prev.explicit == explicit && prev.window.UsedPercent >= window.UsedPercent {
+					continue
+				}
+			}
+			byKey[window.Key] = candidate{window: window, explicit: explicit}
 		}
 	}
 	if len(byKey) == 0 {
 		return nil
 	}
 	windows := make([]QuotaWindow, 0, len(byKey))
-	for _, window := range byKey {
-		windows = append(windows, window)
+	for _, entry := range byKey {
+		windows = append(windows, entry.window)
 	}
 	sort.Slice(windows, func(i, j int) bool { return windows[i].Key < windows[j].Key })
 	return windows
