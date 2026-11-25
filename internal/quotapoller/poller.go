@@ -95,7 +95,18 @@ type authPollState struct {
 	credentialVersion uint64
 	registrationEpoch uint64
 	failures          int
+	lastRelease       time.Time
 }
+
+// quotaReleaser is implemented by *coreauth.Manager: lift a quota lock once a
+// fresh poll shows usage is back (e.g. after an early usage reset).
+type quotaReleaser interface {
+	ReleaseRecoveredQuota(ctx context.Context, authID string, windows []coreauth.QuotaWindow) bool
+}
+
+// releaseSpacing limits automatic lock releases per credential, in case a poll
+// reads below 100% while the provider still refuses requests.
+const releaseSpacing = 30 * time.Minute
 
 // Poller fetches usage windows for every enabled Claude/Codex OAuth credential
 // at startup, shortly after a credential is added or its token changes, and
@@ -274,6 +285,7 @@ func (p *Poller) pollAndRecord(ctx context.Context, auth *coreauth.Auth, interva
 	case errPoll == nil:
 		if len(windows) > 0 {
 			p.opts.Manager.ObserveQuotaWindows(auth.ID, windows)
+			p.maybeReleaseQuota(ctx, auth, windows, now, entry)
 		}
 		entry.Debugf("quota poll: recorded %d window(s)", len(windows))
 		next = p.jittered(interval)
@@ -309,6 +321,30 @@ func (p *Poller) pollAndRecord(ctx context.Context, auth *coreauth.Auth, interva
 	state.failures = failures
 	state.nextPoll = now.Add(next)
 	p.mu.Unlock()
+}
+
+func (p *Poller) maybeReleaseQuota(ctx context.Context, auth *coreauth.Auth, windows []coreauth.QuotaWindow, now time.Time, entry *log.Entry) {
+	releaser, ok := p.opts.Manager.(quotaReleaser)
+	if !ok {
+		return
+	}
+	p.mu.Lock()
+	recent := false
+	if state := p.states[auth.ID]; state != nil && !state.lastRelease.IsZero() && now.Sub(state.lastRelease) < releaseSpacing {
+		recent = true
+	}
+	p.mu.Unlock()
+	if recent || !releaser.ReleaseRecoveredQuota(ctx, auth.ID, windows) {
+		return
+	}
+	p.mu.Lock()
+	if state := p.states[auth.ID]; state != nil {
+		state.lastRelease = now
+	} else {
+		p.states[auth.ID] = &authPollState{lastRelease: now, credentialVersion: auth.CredentialVersion, registrationEpoch: auth.RegistrationEpoch}
+	}
+	p.mu.Unlock()
+	entry.Info("quota poll: usage is back below 100%; lifted the quota lock")
 }
 
 func backoffFor(interval time.Duration, failures int) time.Duration {

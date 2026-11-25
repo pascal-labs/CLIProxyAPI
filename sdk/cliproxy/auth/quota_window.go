@@ -456,3 +456,46 @@ func QuotaResetTimeFromUnix(value float64) (time.Time, bool) {
 func roundQuotaPercent(value float64) float64 {
 	return math.Round(value*100) / 100
 }
+
+// ReleaseRecoveredQuota lifts an account's quota lock when a fresh usage poll shows
+// every window below 100% used. A 429 locks the account until the provider's
+// resets_at (days away for a weekly limit). If usage comes back sooner (e.g. the
+// operator used an early reset), nothing else lifts that lock, and every request
+// is refused until the old reset time. Lifting a lock by mistake costs one request:
+// the next 429 locks the account again. Returns true when it lifted a lock.
+func (m *Manager) ReleaseRecoveredQuota(ctx context.Context, authID string, windows []QuotaWindow) bool {
+	if m == nil || strings.TrimSpace(authID) == "" || len(windows) == 0 {
+		return false
+	}
+	for _, window := range windows {
+		if window.UsedPercent >= 100 {
+			return false
+		}
+	}
+	now := time.Now()
+	m.mu.Lock()
+	auth := m.auths[authID]
+	locked := auth != nil && !auth.Disabled && quotaLocked(auth, now)
+	m.mu.Unlock()
+	if !locked {
+		return false
+	}
+	updated, _, errReset := m.ResetQuota(ctx, authID)
+	return errReset == nil && updated != nil
+}
+
+// quotaLocked reports whether the auth or any of its models is in a quota cooldown.
+func quotaLocked(auth *Auth, now time.Time) bool {
+	locked := func(q QuotaState, retry time.Time) bool {
+		return q.Exceeded && (q.NextRecoverAt.After(now) || retry.After(now))
+	}
+	if locked(auth.Quota, auth.NextRetryAfter) {
+		return true
+	}
+	for _, state := range auth.ModelStates {
+		if state != nil && locked(state.Quota, state.NextRetryAfter) {
+			return true
+		}
+	}
+	return false
+}
